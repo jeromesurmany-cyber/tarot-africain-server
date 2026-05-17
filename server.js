@@ -237,6 +237,8 @@ function broadcastState(room, message = '') {
         mySeatIndex: si,
         gameMode: room.gameMode,
         startingLives: room.startingLives,
+        // Token de reconnexion pour ce joueur
+        myReconnectToken: p.reconnectToken || null,
         message,
       }
     });
@@ -655,12 +657,52 @@ function handleMessage(ws, msg) {
       break;
     }
 
+    case 'RECONNECT': {
+      const { token, name } = msg;
+      const info = reconnectTokens.get(token);
+      if (!info) {
+        send(ws, 'ERROR', { message: 'Token de reconnexion invalide ou expiré.' });
+        return;
+      }
+      const room = rooms.get(info.roomCode);
+      if (!room) {
+        send(ws, 'ERROR', { message: 'La partie n\'existe plus.' });
+        reconnectTokens.delete(token);
+        return;
+      }
+      const slot = room.players.find(p => p.seatIndex === info.seatIndex);
+      if (!slot || !slot.disconnected) {
+        send(ws, 'ERROR', { message: 'Ce slot n\'est plus disponible.' });
+        reconnectTokens.delete(token);
+        return;
+      }
+
+      // Reconnecter le joueur
+      slot.ws = ws;
+      slot.id = ws.id;
+      slot.isAI = false;
+      slot.disconnected = false;
+      slot.reconnectToken = null;
+      slot.name = name || info.name;
+      ws.roomCode = info.roomCode;
+
+      if (info.isHost) room.hostId = ws.id;
+
+      reconnectTokens.delete(token);
+      broadcastState(room, `✓ ${slot.name} s'est reconnecté !`);
+      break;
+    }
+
     case 'LEAVE_ROOM': {
       handleDisconnect(ws);
       break;
     }
   }
 }
+
+// Tokens de reconnexion : Map<token, { playerId, roomCode, seatIndex, name, isHost }>
+const reconnectTokens = new Map();
+const RECONNECT_GRACE_MS = 30000; // 30 secondes avant de passer en IA
 
 function handleDisconnect(ws) {
   const code = ws.roomCode;
@@ -672,31 +714,65 @@ function handleDisconnect(ws) {
   if (!slot) return;
 
   if (ws.id === room.hostId && room.phase !== 'lobby') {
-    // L'hôte quitte en cours de partie → fin de partie
-    broadcast(room, 'HOST_LEFT', { message: "L'hôte a quitté la partie." });
-    clearTimers(room);
-    rooms.delete(code);
+    // L'hôte quitte en cours de partie — délai de grâce aussi pour lui
+    // (il peut se reconnecter et reprendre le contrôle)
+  }
+
+  if (room.phase === 'lobby') {
+    // En lobby : remplacement immédiat par IA
+    _replaceWithAI(room, slot);
+    broadcastLobby(room);
+    ws.roomCode = null;
     return;
   }
 
-  // Remplacer ce joueur par une IA
+  // En cours de partie : délai de grâce de 30 secondes
+  const token = Math.random().toString(36).slice(2, 10).toUpperCase();
+  reconnectTokens.set(token, {
+    playerId: ws.id,
+    roomCode: code,
+    seatIndex: slot.seatIndex,
+    name: slot.name,
+    isHost: ws.id === room.hostId,
+  });
+
+  const playerName = slot.name;
+  // Marquer le slot comme "déconnecté" (pas encore IA)
+  slot.disconnected = true;
+  slot.reconnectToken = token;
+  slot.ws = null;
+
+  broadcastState(room, `⚠ ${playerName} s'est déconnecté. Reconnexion possible pendant 30s…`);
+
+  // Timer : si pas de reconnexion après 30s → IA
+  const timer = setTimeout(() => {
+    if (!rooms.has(code)) return;
+    const currentSlot = room.players.find(p => p.seatIndex === slot.seatIndex);
+    if (!currentSlot || !currentSlot.disconnected) return; // déjà reconnecté
+
+    reconnectTokens.delete(token);
+    _replaceWithAI(room, currentSlot);
+
+    broadcastState(room, `${currentSlot.name} remplacé par une IA.`);
+    if (room.phase === 'playing' && room.currentPlayerIndex === currentSlot.seatIndex) {
+      scheduleAiPlay(room);
+    } else if (room.phase === 'bidding' && room.currentPlayerIndex === currentSlot.seatIndex) {
+      scheduleAiBid(room, getBidOrder(room.dealerIndex));
+    }
+  }, RECONNECT_GRACE_MS);
+
+  room.aiTimers.push(timer);
+  ws.roomCode = null;
+}
+
+function _replaceWithAI(room, slot) {
+  const names = ['Merlin', 'Oracle', 'Sphinx'];
   slot.isAI = true;
   slot.id = `ai_dc_${slot.seatIndex}`;
   slot.ws = null;
-  slot.name = slot.name + ' (IA)';
-  ws.roomCode = null;
-
-  if (room.phase === 'lobby') {
-    broadcastLobby(room);
-  } else {
-    broadcastState(room, `${slot.name} a quitté. Une IA prend sa place.`);
-    // Si c'était son tour, l'IA joue
-    if (room.phase === 'playing' && room.currentPlayerIndex === slot.seatIndex) {
-      scheduleAiPlay(room);
-    } else if (room.phase === 'bidding' && room.currentPlayerIndex === slot.seatIndex) {
-      scheduleAiBid(room, getBidOrder(room.dealerIndex));
-    }
-  }
+  slot.disconnected = false;
+  slot.reconnectToken = null;
+  slot.name = names[slot.seatIndex - 1] || slot.name;
 }
 
 function getRoomOf(ws) {
