@@ -217,7 +217,7 @@ function broadcastState(room, message = '') {
         round: room.round,
         dealerIndex: room.dealerIndex,
         hands: visibleHands,
-        rawHandCount: room.hands.map(h => h.length), // pour afficher le nb de cartes adverses
+        rawHandCount: room.hands.map(h => h.length),
         bids: room.bids,
         tricksWon: room.tricksWon,
         scores: room.scores,
@@ -227,6 +227,9 @@ function broadcastState(room, message = '') {
         trickWinner: room.trickWinner,
         excuseEffectiveValues: room.excuseEffectiveValues,
         lastRoundPoints: room.lastRoundPoints,
+        // IDs des joueurs ayant confirmé la preview (pour afficher "en attente de X")
+        previewConfirmedIds: room._previewReady ? [...room._previewReady] : [],
+        iConfirmedPreview: room._previewReady ? room._previewReady.has(p.id) : false,
         players: room.players.map(pl => ({
           id: pl.id, name: pl.name,
           seatIndex: pl.seatIndex, isAI: pl.isAI,
@@ -556,14 +559,24 @@ function handleMessage(ws, msg) {
       const player = room.players.find(p => p.id === ws.id);
       if (!player) return;
 
-      // Tous les humains doivent confirmer avant de lancer les enchères
       if (!room._previewReady) room._previewReady = new Set();
       room._previewReady.add(ws.id);
 
       const humanPlayers = room.players.filter(p => !p.isAI);
-      if (room._previewReady.size >= humanPlayers.length) {
+      const readyCount = room._previewReady.size;
+      const totalCount = humanPlayers.length;
+
+      if (readyCount >= totalCount) {
         room._previewReady = null;
         startBidding(room);
+      } else {
+        // Broadcaster qui a confirmé et combien restent
+        const waitingFor = humanPlayers
+          .filter(p => !room._previewReady.has(p.id))
+          .map(p => p.name);
+        broadcastState(room, `${player.name} est prêt. En attente de : ${waitingFor.join(', ')}…`);
+        // Marquer dans le state que ce joueur a confirmé
+        room._previewConfirmed = room._previewReady;
       }
       break;
     }
@@ -736,16 +749,17 @@ function startUdpDiscovery() {
 
 httpServer.listen(PORT, '0.0.0.0', () => {
   const ips = getLocalIPs();
-  const isCloud = ips.length === 0 || process.env.RAILWAY_ENVIRONMENT;
-  console.log('\n🃏 Tarot Africain — Serveur démarré');
-  console.log(`   Port : ${PORT}`);
-  if (isCloud) {
-    console.log('   Mode : Cloud (Railway)');
-    console.log('   UDP discovery : désactivée');
-  } else {
-    console.log('   Mode : Réseau local');
-    ips.forEach(ip => console.log(`   IP locale : ${ip}`));
-    startUdpDiscovery();
-  }
-  console.log('');
+  console.log('\n╔══════════════════════════════════════╗');
+  console.log('║   🃏 Tarot Africain — Serveur LAN    ║');
+  console.log('╠══════════════════════════════════════╣');
+  console.log(`║  WebSocket + HTTP : port ${PORT}          ║`);
+  console.log(`║  Découverte UDP   : port ${UDP_PORT}          ║`);
+  console.log('║  IP réseau local :                   ║');
+  ips.forEach(ip => console.log(`║    → ${ip.padEnd(30)} ║`));
+  console.log('╠══════════════════════════════════════╣');
+  console.log('║  Partagez une IP aux autres joueurs  ║');
+  console.log('║  Ils ouvrent http://[IP]:5173        ║');
+  console.log('╚══════════════════════════════════════╝\n');
+
+  startUdpDiscovery();
 });
